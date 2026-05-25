@@ -15,6 +15,14 @@ import sys
 import argparse
 from pathlib import Path
 
+# Windows 兼容：强制 stdout/stderr UTF-8（避免 GBK 编码错误）
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass  # Python < 3.7 不支持
+
 # 添加当前目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent))
 
