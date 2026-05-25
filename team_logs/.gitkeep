@@ -1,0 +1,3 @@
+# Team Layer 终端日志根目录
+# 各终端的 LogCollector 会按 {hostname}_{username}_{timestamp}.jsonl 命名写入
+# CentralAggregator 按目录扫描合并。
