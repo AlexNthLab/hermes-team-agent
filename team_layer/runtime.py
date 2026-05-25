@@ -8,7 +8,7 @@ PR 1: Team Agent 适配器层 — Hermes 核心 + Team 记忆管理 + 压缩钩�
 - 压缩钩子：压缩前 on_pre_compress 保护关键信息
 """
 
-from typing import List, Optional, Dict, Any
+from typing import Any, Callable, Dict, List, Optional
 import os
 import json
 from pathlib import Path
@@ -176,6 +176,124 @@ class TeamAgent:
         """会话结束 — 持久化所有记忆"""
         self.team_mem.on_session_end()
         print(f"[INFO] Session {self.session_id} finalized")
+
+    # ────────────────────────────────────────────────────────────
+    # PR 7: Backend-driven 主循环
+    # ────────────────────────────────────────────────────────────
+
+    def run_with_backend(
+        self,
+        backend,                       # AgentBackend (避免顶层 import 循环)
+        goal: str,
+        max_turns: int = 5,
+        per_turn_prompt: Optional[Callable[[int, "TeamAgent"], str]] = None,
+        error_sig_fn: Optional[Callable[[Any], Optional[str]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        用 AgentBackend 驱动主循环（替代 mock 模式）
+
+        Args:
+            backend: 任意 AgentBackend 实现（mock / hermes / claude_code / ...）
+            goal: 任务目标（写入 SessionConfig + 第一轮 prompt）
+            max_turns: 最大轮次
+            per_turn_prompt: 每轮的 prompt 生成函数 fn(turn_idx, agent) -> str
+                             默认：第一轮用 goal，之后用 "continue"
+            error_sig_fn: 从 TurnResponse 提取 error_sig 的函数（供 EvoLoop 记账）
+                          默认：finish_reason=='error' 时用 backend.backend_id
+
+        Returns:
+            {
+                "session_summary": SessionSummary 对象,
+                "turns": [{"prompt": ..., "response": ...}, ...],
+                "agent_id": ...,
+                "backend_id": ...,
+            }
+        """
+        # 1. 从 backend 模块导入数据类
+        from .backends import SessionConfig
+
+        # 2. 启动 backend session
+        config = SessionConfig(
+            session_id=self.session_id,
+            goal=goal,
+        )
+        backend.start_session(config)
+        print(f"[BACKEND] {backend.backend_id} session started: {self.session_id}")
+
+        # 3. 默认 prompt 生成器
+        if per_turn_prompt is None:
+            def per_turn_prompt(turn_idx: int, agent: "TeamAgent") -> str:
+                return goal if turn_idx == 0 else "continue"
+
+        # 4. 主循环
+        turns_log = []
+        system_prompt = self.get_system_prompt_with_memory(
+            base_prompt="You are a team-aware AI agent."
+        )
+
+        for turn_idx in range(max_turns):
+            prompt = per_turn_prompt(turn_idx, self)
+            response = backend.send_turn(prompt, system_prompt)
+
+            # 记录到 history（与 mock 模式一致）
+            action = {"type": "backend_turn", "backend": backend.backend_id, "prompt": prompt}
+            self.append_history(action, response.content)
+
+            # 记入 Ledger（供 EvoLoop 跨 backend 学习）
+            ledger = self.team_mem.providers.get("LedgerProvider")
+            if ledger:
+                error_sig = None
+                if response.is_error:
+                    error_sig = (
+                        error_sig_fn(response) if error_sig_fn
+                        else f"{backend.backend_id}_{response.finish_reason}"
+                    )
+                ledger.record(
+                    agent_id=self.agent_id,
+                    action_type=f"backend:{backend.backend_id}",
+                    result=response.content[:200] if response.content else (response.error or ""),
+                    error_sig=error_sig,
+                    token_cost=response.usage.total,
+                )
+
+            turns_log.append({
+                "turn": turn_idx + 1,
+                "prompt": prompt,
+                "response_content": response.content,
+                "finish_reason": response.finish_reason,
+                "tokens": response.usage.total,
+                "latency": response.latency_seconds,
+                "error": response.error,
+            })
+
+            print(
+                f"[TURN {turn_idx+1}/{max_turns}] {backend.backend_id} "
+                f"finish={response.finish_reason} tokens={response.usage.total} "
+                f"latency={response.latency_seconds:.2f}s"
+            )
+
+            # 错误中断
+            if response.is_error:
+                print(f"[BACKEND] error: {response.error}")
+                break
+
+            # 压缩检查
+            if self.should_compact():
+                self.trigger_compression()
+
+        # 5. 关闭 session
+        summary = backend.end_session()
+        print(
+            f"[BACKEND] session ended: {summary.total_turns} turns, "
+            f"{summary.total_usage.total} tokens, {summary.duration_seconds:.1f}s"
+        )
+
+        return {
+            "session_summary": summary,
+            "turns": turns_log,
+            "agent_id": self.agent_id,
+            "backend_id": backend.backend_id,
+        }
 
 
 # 便利函数：快速创建 Team Agent

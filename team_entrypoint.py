@@ -32,9 +32,11 @@ team_entrypoint.py — Nth Team Agent 统一启动入口（PR 1-5 集成）
 """
 
 import argparse
+import json
 import sys
 import traceback
 from pathlib import Path
+from typing import Optional
 
 # Windows 兼容：强制 stdout/stderr UTF-8（避免 GBK 编码错误）
 if sys.platform == "win32":
@@ -47,6 +49,7 @@ if sys.platform == "win32":
 sys.path.insert(0, str(Path(__file__).parent))
 
 from team_layer import TeamAgent, TeamMemoryManager
+from team_layer.backends import BackendUnavailableError, default_registry
 from team_layer.compression import CompressionPipeline
 from team_layer.evolution import EvoLoop
 from team_layer.git_sync import LogCollector, SkillLoader, SyncConfig
@@ -192,6 +195,43 @@ def shutdown_hook(agent: TeamAgent, args, cfg: SyncConfig) -> None:
 # 主循环
 # ══════════════════════════════════════════════════════════════
 
+def run_agent_loop_with_backend(
+    agent: TeamAgent,
+    backend_id: str,
+    goal: str,
+    max_iterations: int,
+    cfg: SyncConfig,
+    backend_kwargs: Optional[dict] = None,
+) -> None:
+    """
+    PR 7: backend-driven 主循环
+
+    使用任意 AgentBackend（mock / hermes / claude_code / openclaw / codex / openhands）
+    """
+    print(f"\n{'='*60}")
+    print(f"Team Agent: {agent.agent_id}")
+    print(f"Backend:    {backend_id}")
+    print(f"Goal:       {goal}")
+    print(f"Session:    {agent.session_id}")
+    print(f"{'='*60}\n")
+
+    try:
+        backend = default_registry.create(backend_id, **(backend_kwargs or {}))
+    except BackendUnavailableError as e:
+        print(f"[ERROR] Backend '{backend_id}' unavailable: {e}")
+        print(f"[ERROR] Available now: {default_registry.list_available(refresh=True)}")
+        raise
+
+    result = agent.run_with_backend(
+        backend=backend,
+        goal=goal,
+        max_turns=max_iterations,
+    )
+
+    print(f"\n✅ Backend session done — {result['session_summary'].total_turns} turns, "
+          f"{result['session_summary'].total_usage.total} tokens")
+
+
 def run_agent_loop(agent: TeamAgent, goal: str, max_iterations: int, cfg: SyncConfig) -> None:
     """
     主循环（mock 版本 — 实际应与 Hermes Agent.run() 集成）
@@ -268,11 +308,20 @@ Examples:
     )
 
     # 核心参数
-    parser.add_argument("--goal", type=str, required=True, help="Agent 的目标任务")
+    parser.add_argument("--goal", type=str, help="Agent 的目标任务 (使用 --list-backends 时可省略)")
     parser.add_argument("--agent", type=str, default="team-agent-1", help="Agent ID")
     parser.add_argument("--iterations", type=int, default=5, help="最大迭代次数")
     parser.add_argument("--compression-threshold", type=float, default=0.75,
                         help="压缩触发阈值 (0.0-1.0, 默认 0.75)")
+
+    # PR 7: Backend 选择
+    parser.add_argument("--backend", type=str, default=None,
+                        choices=["mock", "hermes", "claude_code", "openclaw", "codex", "openhands"],
+                        help="Agent backend (默认: 内置 mock 主循环)")
+    parser.add_argument("--backend-config", type=str, default=None,
+                        help="JSON 字符串，传递给 backend 构造器")
+    parser.add_argument("--list-backends", action="store_true",
+                        help="列出所有 backend 与可用性")
 
     # PR 5 集成 flag
     parser.add_argument("--reload-skills", action="store_true",
@@ -288,10 +337,26 @@ Examples:
 
     args = parser.parse_args()
 
+    # ─── PR 7: --list-backends 短路退出 ───
+    if args.list_backends:
+        desc = default_registry.describe(refresh=True)
+        print("Registered backends:")
+        for bid, info in desc.items():
+            status = "✅ AVAILABLE  " if info["available"] else "⛔ unavailable"
+            note = info["capabilities"].get("notes", "")
+            print(f"  {bid:15s} {status}  {note}")
+            if info.get("error"):
+                print(f"    └─ error: {info['error']}")
+        sys.exit(0)
+
+    if not args.goal:
+        parser.error("--goal is required (unless --list-backends)")
+
     # 同步配置（auto_push 与 --no-push 联动）
     cfg = SyncConfig(auto_push=not args.no_push)
     print(f"[CONFIG] {cfg.describe()}")
-    print(f"[CONFIG] auto_collect={args.auto_collect}, auto_evolve={args.auto_evolve}, "
+    print(f"[CONFIG] backend={args.backend or 'built-in mock loop'}, "
+          f"auto_collect={args.auto_collect}, auto_evolve={args.auto_evolve}, "
           f"reload_skills={args.reload_skills}, push_enabled={not args.no_push}")
 
     agent = None
@@ -307,7 +372,15 @@ Examples:
         )
 
         # 3. 主循环（含 PR 3 压缩 + 运行时 reload）
-        run_agent_loop(agent, args.goal, args.iterations, cfg)
+        if args.backend:
+            # PR 7: backend-driven 主循环
+            backend_kwargs = json.loads(args.backend_config) if args.backend_config else {}
+            run_agent_loop_with_backend(
+                agent, args.backend, args.goal, args.iterations, cfg, backend_kwargs,
+            )
+        else:
+            # 经典 mock 循环
+            run_agent_loop(agent, args.goal, args.iterations, cfg)
 
         # 4. 收尾钩子（PR 4 evolve + PR 5 collect）
         shutdown_hook(agent, args, cfg)
