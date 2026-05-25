@@ -1,0 +1,19 @@
+# Team Layer 额外依赖（在 requirements.txt 基础上）
+
+# 数据序列化与配置
+pydantic>=2.0  # 契约定义与验证
+python-dotenv>=0.19.0  # .env 配置管理
+
+# 向量存储（可选）
+# sqlite-vec>=0.1.0  # SQLite 向量扩展（未来支持）
+
+# 后端 API 与集成（后期加密交易时需要）
+# web3>=6.0.0  # Ethereum 集成
+# pydantic-settings>=2.0  # 环境变量管理
+
+# 日志与监控
+python-json-logger>=2.0  # JSON 格式日志
+
+# 测试与开发
+pytest>=7.0  # 测试框架
+pytest-asyncio>=0.21.0  # 异步测试支持
